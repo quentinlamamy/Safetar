@@ -1,0 +1,373 @@
+#!/bin/bash
+
+# ┌───────────────────────────────────────────────────────────────────────┐
+# │                                                                       │
+# │   ███████╗ █████╗ ███████╗███████╗████████╗ █████╗ ██████╗            │
+# │   ██╔════╝██╔══██╗██╔════╝██╔════╝╚══██╔══╝██╔══██╗██╔══██╗           │
+# │   ███████╗███████║█████╗  █████╗     ██║   ███████║██████╔╝           │
+# │   ╚════██║██╔══██║██╔══╝  ██╔══╝     ██║   ██╔══██║██╔══██╗           │
+# │   ███████║██║  ██║██║     ███████╗   ██║   ██║  ██║██║  ██║           │
+# │   ╚══════╝╚═╝  ╚═╝╚═╝     ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝           │
+# │                                                                       │
+# │                        Secure Archiver with Integrity Check           │
+# │                                                                       │
+# ├───────────────────────────────────────────────────────────────────────┤
+# │                                                                       │
+# │  Author   : Quentin Lamamy                                            │
+# │  Version  : 1.0.0                                                     │
+# │  Date     : 2026-01-06                                                │
+# │                                                                       │
+# │  Description:                                                         │
+# │    Fast parallel compression with tar/pigz and integrity verification │
+# │    Supports quick (gzip test) and paranoid (byte-by-byte diff) modes  │
+# │                                                                       │
+# │  Dependencies: pigz, pv, gtar                                         │
+# │                                                                       │
+# └───────────────────────────────────────────────────────────────────────┘
+
+# region ANSI Color
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+GREY='\033[1;30m'
+RESET='\033[0m'
+# endregion
+
+TITLE="SAFETAR Secure Archiver"
+DEPENDENCIES=(pigz pv gtar)
+hostOsType=""
+hostTarCmd=''
+
+# region Fx
+
+    # region OS Detection
+
+    detect_os() {
+        case "$OSTYPE" in
+            darwin*) hostOsType="OSX" ;;
+            linux*)  hostOsType="LINUX" ;;
+            *)       print_error "Unsupported OS: $OSTYPE"; exit 1 ;;
+        esac
+    }
+
+    # endregion OS Detection
+
+    # region Dependency Management
+
+    # Check if a command exists
+    # @param {String} $1 Command name
+    command_exists() {
+        command -v "$1" >/dev/null 2>&1
+    }
+
+    # Check for multiple dependencies
+    check_dependency() {
+        for dep in "$@"; do
+            if ! command_exists "$dep"; then
+                print_error "Missing dependency: $dep"
+                return 1
+            fi
+        done
+        return 0
+    }
+
+    # endregion Dependency Management
+
+    # region Print Functions
+
+    print_error() {
+        echo -e "${RED}Error: $1${RESET}\n"
+    }
+
+    print_success() {
+        echo -e "${GREEN}✔ $1${RESET}"
+    }
+
+    print_info() {
+        echo -e "${BLUE}$1${RESET}"
+    }
+
+    print_warning() {
+        echo -e "${YELLOW}Warning: $1${RESET}"
+    }
+
+    # endregion Print Functions
+
+    # region Ui
+
+    draw_horizontal_line() {
+        local width=$1
+           local line
+           line=$(printf '─%.0s' $(seq 1 $width))
+           echo "$line"
+    }
+
+    pad_center(){
+
+        local text="$1"
+        local width=$2
+        local filler=" "
+        if [ -n "$3" ]; then
+            filler="$3"
+        fi
+        local text_length=${#text}
+        if [ $text_length -ge $width ]; then
+            echo "$text"
+            return
+        fi
+        local total_padding=$((width - text_length))
+        local left_padding=$((total_padding / 2))
+        local right_padding=$((total_padding - left_padding))
+        printf '%s' "$(printf "%${left_padding}s" | tr ' ' "$filler")"
+        printf '%s' "$text"
+        printf '%s' "$(printf "%${right_padding}s" | tr ' ' "$filler")"
+
+    }
+
+    pad_right(){
+        local text="$1"
+        local width=$2
+        local filler=" "
+        if [ -n "$3" ]; then
+            filler="$3"
+        fi
+        # Remove escape sequences for length calculation
+        local plain_text=$(echo -e "$text" | sed -E 's/\x1B\[[0-9;]*[mK]//g')
+        local text_length=${#plain_text}
+        if [ $text_length -ge $width ]; then
+            echo "$text"
+            return
+        fi
+        local padding=$((width - text_length))
+        printf '%s' "$text"
+        printf '%s' "$(printf "%${padding}s" | tr ' ' "$filler")"
+    }
+
+    # endregion Ui
+
+    # region Misc
+
+        # Display usage information
+        usage(){
+            echo "Usage: safetar <folder> [--check | --paranoid | --force] Compress with optional integrity checks." 
+            echo ""
+            echo "Options:"
+            echo "  -f, --force          Overwrite existing archive without prompt."
+            echo "  -c, --check          Perform a quick integrity check after compression."
+            echo "  -p, --paranoid       Perform a thorough integrity check using diff after compression."
+            echo "  -i, --install        Install missing dependencies."
+            echo "  -h, --help           Display this help message."
+            echo ""
+        }
+
+        init(){
+            detect_os
+        }
+
+    # endregion Misc
+
+# endregion Fx
+
+clear
+init
+
+# region Dependency Check
+
+if ! check_dependency "${DEPENDENCIES[@]}"; then
+    print_error "One or more dependencies are missing. Run with --install to set up."
+    exit 1
+fi
+
+# endregion Dependency Check
+
+# region Arguments
+
+sourcePath=""
+MODE="Standard"
+MODE_FLAG="none"
+FORCE=false
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --check|-c)
+            if [[ "$MODE_FLAG" != "none" ]]; then
+                print_error "Options --check and --paranoid are mutually exclusive."
+                usage
+                exit 1
+            fi
+            MODE="Integrity Check"; MODE_FLAG="quick" ;;
+        --paranoid|-p)
+            if [[ "$MODE_FLAG" != "none" ]]; then
+                print_error "Options --check and --paranoid are mutually exclusive."
+                usage
+                exit 1
+            fi
+            MODE="Paranoid (Diff)"; MODE_FLAG="paranoid" ;;
+        --force|-f)
+            FORCE=true ;;
+        --install|-i)
+            install_dependencies ;;
+        -h|--help)
+            usage; exit 0 ;;
+        *) sourcePath="$1" ;;
+    esac
+    shift
+done
+
+[[ -z "$sourcePath" ]] && { print_error "No source folder specified."; usage; exit 1; }
+[[ ! -e "$sourcePath" ]] && { print_error "Source folder '$sourcePath' does not exist."; exit 1; }
+[[ ! -d "$sourcePath" ]] && { print_error "Source '$sourcePath' is not a directory."; exit 1; }
+
+# endregion Arguments
+
+# region Path & data prep
+
+sourcePath="${sourcePath%/}"
+sourceFolderName=$(basename "$sourcePath")
+sourceParentFolderAbsolutePath=$(cd "$(dirname "$sourcePath")" && pwd)
+outputFilePath="${PWD}/${sourceFolderName}.tar.gz"
+outputFileName=$(basename "$outputFilePath")
+
+cd "$sourceParentFolderAbsolutePath"
+SIZE_KB=$(du -sk "$sourceFolderName" | awk '{print $1}')
+SIZE_BYTES=$((SIZE_KB * 1024))
+
+if [[ $hostOsType == "OSX" ]]; then
+    hostTarCmd="gtar"
+else
+    hostTarCmd="tar"
+fi
+
+# endregion Path & data prep
+
+# region Header
+
+RAW_OUT="Output : $outputFileName"
+RAW_MODE="Mode   : $MODE"
+
+MAX_WIDTH=${#TITLE}
+[[ ${#RAW_OUT} -gt $MAX_WIDTH ]] && MAX_WIDTH=${#RAW_OUT}
+[[ ${#RAW_MODE} -gt $MAX_WIDTH ]] && MAX_WIDTH=${#RAW_MODE}
+
+BOX_WIDTH=$((MAX_WIDTH + 2))
+
+echo -e "${GREY}┌$(draw_horizontal_line $BOX_WIDTH)┐${RESET}"
+echo -e "${GREY}│${RESET}$(pad_center "$TITLE" $((BOX_WIDTH)) "")${GREY}│${RESET}"
+echo -e "${GREY}├$(draw_horizontal_line $BOX_WIDTH)┤${RESET}"
+
+OUTPUT_LINE=" Output : ${BLUE}${outputFileName}${RESET}"
+echo -e "${GREY}│${RESET}$(pad_right "$OUTPUT_LINE" $((BOX_WIDTH))  "")${GREY}│${RESET}"
+
+MODE_LINE=" Mode   : ${MODE}"
+echo -e "${GREY}│${RESET}$(pad_right "$MODE_LINE" $((BOX_WIDTH))  "")${GREY}│${RESET}"
+
+echo -e "${GREY}└$(draw_horizontal_line $BOX_WIDTH)┘${RESET}"
+
+echo ""
+# endregion Header
+
+# region Overwrite Check
+if [ -f "$outputFilePath" ]; then
+    if [ "$FORCE" = false ]; then
+        echo -ne "${YELLOW}Warning: Output file exists. Overwrite? (Y/N): ${RESET}"
+        read -n 1 -r
+        if [[ ! $REPLY =~ ^[yY]$ ]]; then echo -e "\n${RED}Aborted.${RESET}"; exit 1; fi
+        echo -ne "\r\033[K" # Efface la ligne
+    fi
+fi
+# endregion Overwrite Check
+
+# region Progress Bar
+
+read_progress_data(){
+
+    local label=$1
+
+    while read -r pct; do
+        [[ "$pct" =~ ^[0-9]+$ ]] || continue
+        displayProgressBarFromPercent $pct "$label"
+    done
+
+}
+
+displayProgressBarFromPercent(){
+
+    local percent=$1
+    local label=$2
+
+    # UI
+    local empty="━"; local filled="━"
+    local width=50
+
+    local filledLength=$(( percent * width / 100 ))
+    local empty_length=$(( width - filledLength ))
+
+    f=$(printf "%${filledLength}s" | tr ' ' "$filled")
+    e=$(printf "%${empty_length}s" | tr ' ' "$empty")
+
+    printf "\r${label}  ${BLUE}${f}${RESET}${YELLOW}${e}${RESET} ${percent}%%"
+
+}
+
+# endregion Progress Bar
+
+run(){
+
+    ( $hostTarCmd -cf - "$sourceFolderName" | pv -n -s $SIZE_BYTES -i 0.1 | pigz -9 > "$outputFilePath" ) 2>&1 | read_progress_data "Compressing :"
+
+    echo ""
+
+    if [ "$MODE_FLAG" != "none" ]; then
+
+        # region Quick Verification
+
+        if [ "$MODE_FLAG" == "quick" ]; then
+                
+            ARCHIVE_SIZE=$(stat -f%z "$outputFilePath" 2>/dev/null || stat -c%s "$outputFilePath" 2>/dev/null)
+
+            ( pv -n -s $ARCHIVE_SIZE -i 0.1 "$outputFilePath" | pigz -t -p $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1) ) 2>&1 | read_progress_data "Verifying   :"
+
+            CHECK_RESULT=${PIPESTATUS[0]}
+            
+            echo ""
+            
+            if [ $CHECK_RESULT -ne 0 ]; then
+                print_error "Corruption detected!"
+                exit 1
+            fi
+
+        # endregion Quick Verification
+
+        # region Paranoid Verification
+
+        elif [ "$MODE_FLAG" == "paranoid" ]; then
+
+            ARCHIVE_SIZE=$(stat -f%z "$outputFilePath" 2>/dev/null || stat -c%s "$outputFilePath" 2>/dev/null)
+            
+            ( pv -n -s $ARCHIVE_SIZE -i 0.1 "$outputFilePath" | pigz -dc -p $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) | $hostTarCmd -df - --warning=no-timestamp ) 2>&1 | read_progress_data "Verifying   :"
+
+            CHECK_RESULT=${PIPESTATUS[0]}
+            
+            echo ""
+            
+            if [ $CHECK_RESULT -ne 0 ]; then
+                print_error "Archive verification failed!"
+                exit 1
+            fi
+
+        fi
+
+        # endregion Paranoid Verification
+
+    fi
+
+    echo ""
+    
+    print_success "Archive created successfully."
+    echo ""
+    exit 0
+
+}
+
+run
